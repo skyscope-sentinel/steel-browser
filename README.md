@@ -1,46 +1,4 @@
-<br />
-<p align="center">
-<a href="https://steel.dev">
-  <img src="images/steel_header_logo.png" alt="Steel Logo" width="100">
-</a>
-</p>
 
-
-
-<h3 align="center"><b>Steel</b></h3>
-<p align="center">
-    <b>The open-source browser API for AI agents & apps.</b> <br />
-    The best way to build live web agents and browser automation tools.
-</p>
-
-<div align="center">
-  
-[![Commit Activity](https://img.shields.io/github/commit-activity/m/steel-dev/steel-browser?color=yellow)](https://github.com/steel-dev/steel-browser/commits/main)
-[![License](https://img.shields.io/github/license/steel-dev/steel-browser?color=yellow)](https://github.com/steel-dev/steel-browser/blob/main/LICENSE)
-[![Discord](https://img.shields.io/discord/1285696350117167226?label=discord)](https://discord.gg/steel-dev)
-[![Twitter Follow](https://img.shields.io/twitter/follow/steeldotdev)](https://twitter.com/steeldotdev)
-[![GitHub stars](https://img.shields.io/github/stars/steel-dev/steel-browser)](https://github.com/steel-dev/steel-browser)
-
-</div>
-
-<h4 align="center">
-    <a href="https://app.steel.dev/sign-up" target="_blank">
-      Get Started
-  </a>  ·
-    <a href="https://docs.steel.dev/" target="_blank">
-      Documentation
-  </a>  ·
-  <a href="https://steel.dev/" target="_blank">
-      Website
-  </a> ·
-  <a href="https://github.com/steel-dev/steel-cookbook" target="_blank">
-      Cookbook
-  </a>
-</h4>
-
-<p align="center">
-  <img src="images/demo.gif" alt="Steel Demo" width="600">
-</p>
 
 ## ✨ Highlights 
 
@@ -59,13 +17,6 @@ Under the hood, it manages sessions, pages, and browser processes, allowing you 
 
 For detailed API documentation and examples, check out our [API reference](https://docs.steel.dev/api-reference) or explore the Swagger UI directly at `http://0.0.0.0:3000/documentation`.
 
-> Steel is in public beta and evolving every day. Your suggestions, ideas, and reported bugs help us immensely. Do not hesitate to join in the conversation on [Discord](https://discord.gg/steel-dev) or raise a GitHub issue. We read everything, respond to most, and love you.
-
-If you love open-source, AI, and dev tools, [we're hiring across the stack](https://steel-dev.notion.site/jobs-at-steel?pvs=74)!
-
-### Make sure to give us a star ⭐
-
-<img width="200" alt="Start us on Github!" src="images/star_img.png">
 
 ## 🛠️ Getting Started
 The easiest way to get started with Steel is by creating a [Steel Cloud](https://app.steel.dev) account. Otherwise, you can deploy this Steel browser instance to a cloud provider or run it locally.
@@ -326,10 +277,6 @@ curl -X POST http://0.0.0.0:3000/v1/pdf \
 ```
 </details>
 
-## Get involved
-Steel browser is an open-source project, and we welcome contributions!
-- Questions/ideas/feedback? Come hangout on [Discord](https://discord.gg/steel-dev)
-- Found a bug? Open an issue on [GitHub](https://github.com/steel-dev/steel-browser/issues)
 
 ## License
 [Apache 2.0](./LICENSE)
