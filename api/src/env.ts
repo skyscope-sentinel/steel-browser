@@ -1,11 +1,12 @@
 import { z } from "zod";
 import { config } from "dotenv";
-import path from "path";
 
 config();
 
 const envSchema = z.object({
-  NODE_ENV: z.enum(["development", "production"]).default("development"),
+  NODE_ENV: z
+    .enum(["test", "development", "staging", "production", "preview"])
+    .default("development"),
   HOST: z.string().optional().default("0.0.0.0"),
   DOMAIN: z.string().optional(),
   PORT: z.string().optional().default("3000"),
@@ -15,6 +16,7 @@ const envSchema = z.object({
     .transform((val) => val === "true" || val === "1")
     .default("false"),
   CDP_REDIRECT_PORT: z.string().optional().default("9222"),
+  CDP_DOMAIN: z.string().optional(),
   PROXY_URL: z.string().optional(),
   DEFAULT_HEADERS: z
     .string()
@@ -64,6 +66,7 @@ const envSchema = z.object({
     .optional()
     .transform((val) => val === "true" || val === "1")
     .default("false"),
+  PROXY_INTERNAL_BYPASS: z.string().optional(),
 });
 
 export const env = envSchema.parse(process.env);

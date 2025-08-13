@@ -1,13 +1,20 @@
-import { CDPService } from "../../services/cdp/cdp.service.js";
 import { FastifyReply } from "fastify";
-import { getErrors } from "../../utils/errors.js";
-import { PDFRequest, ScrapeRequest, ScreenshotRequest } from "./actions.schema.js";
-import { cleanHtml, getMarkdown, getReadabilityContent } from "../../utils/scrape.js";
-import { ScrapeFormat } from "../../types/index.js";
 import { BrowserContext, Page } from "puppeteer-core";
-import { updateLog } from "../../utils/logging.js";
-import { getProxyServer } from "../../utils/proxy.js";
+import { CDPService } from "../../services/cdp/cdp.service.js";
 import { SessionService } from "../../services/session.service.js";
+import { ScrapeFormat } from "../../types/index.js";
+import { getErrors } from "../../utils/errors.js";
+import { updateLog } from "../../utils/logging.js";
+import { IProxyServer } from "../../utils/proxy.js";
+import {
+  cleanHtml,
+  getDefuddleContent,
+  htmlToMarkdown,
+  transformHtml,
+} from "../../utils/scrape/index.js";
+import { normalizeUrl } from "../../utils/url.js";
+import { PDFRequest, ScrapeRequest, ScreenshotRequest } from "./actions.schema.js";
+import { DefuddleResponse } from "defuddle";
 
 export const handleScrape = async (
   sessionService: SessionService,
@@ -18,13 +25,19 @@ export const handleScrape = async (
   const startTime = Date.now();
   let times: Record<string, number> = {};
   const { url, format, screenshot, pdf, proxyUrl, logUrl, delay } = request.body;
+
+  let proxy: IProxyServer | null = null;
+  let context: BrowserContext | null = null;
+
   try {
-    const proxy = await getProxyServer(proxyUrl, sessionService);
+    if (proxyUrl) {
+      proxy = await sessionService.proxyFactory(proxyUrl);
+      await proxy.listen();
+    }
 
     times.proxyTime = Date.now() - startTime;
 
     let page: Page;
-    let context: BrowserContext;
 
     if (!browserService.isRunning()) {
       await browserService.launch();
@@ -40,7 +53,11 @@ export const handleScrape = async (
     }
 
     if (url) {
-      await page.goto(url, { timeout: 30000, waitUntil: "domcontentloaded" });
+      const normalizedUrl = normalizeUrl(url);
+      if (!normalizedUrl) {
+        throw new Error(`Invalid URL: ${url}`);
+      }
+      await page.goto(normalizedUrl, { timeout: 30000, waitUntil: "domcontentloaded" });
       times.pageLoadTime = Date.now() - startTime - times.pageTime;
     }
 
@@ -48,29 +65,61 @@ export const handleScrape = async (
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
 
-    let scrapeResponse: Record<string, any> = { content: {} };
-
     const [{ html, metadata, links }, base64Screenshot, pdfBuffer] = await Promise.all([
       page.evaluate(() => {
-        const getMetaContent = (name: string) => {
-          const element = document.querySelector(`meta[name="${name}"], meta[property="${name}"]`);
+        const getMetaContent = (selector: string) => {
+          const element = document.querySelector(selector);
           return element ? element.getAttribute("content") : null;
+        };
+        const getMetaByName = (name: string) => getMetaContent(`meta[name="${name}"]`);
+        const getMetaByProperty = (property: string) =>
+          getMetaContent(`meta[property="${property}"]`);
+
+        const extractJsonLd = () => {
+          const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+          const jsonLdData: any[] = [];
+          scripts.forEach((script) => {
+            try {
+              const data = JSON.parse(script.textContent || "");
+              jsonLdData.push(data);
+            } catch (e) {
+              console.error(e);
+            }
+          });
+          return jsonLdData;
         };
 
         return {
           html: document.documentElement.outerHTML,
-          links: [...document.links].map((l) => ({ url: l.href, text: l.textContent })),
+          links: [...document.links].map((l) => ({
+            url: l.href,
+            text: l.textContent?.trim() || "",
+          })),
           metadata: {
             title: document.title,
-            ogImage: getMetaContent("og:image") || undefined,
-            ogTitle: getMetaContent("og:title") || undefined,
-            urlSource: window.location.href,
-            description: getMetaContent("description") || undefined,
-            ogDescription: getMetaContent("og:description") || undefined,
-            statusCode: 200, // This will always be 200 if the page loaded successfully
             language: document.documentElement.lang,
+            urlSource: window.location.href,
             timestamp: new Date().toISOString(),
-            published_timestamp: getMetaContent("article:published_time") || undefined,
+
+            description: getMetaByName("description"),
+            keywords: getMetaByName("keywords"),
+            author: getMetaByName("author"),
+
+            ogTitle: getMetaByProperty("og:title"),
+            ogDescription: getMetaByProperty("og:description"),
+            ogImage: getMetaByProperty("og:image"),
+            ogUrl: getMetaByProperty("og:url"),
+            ogSiteName: getMetaByProperty("og:site_name"),
+
+            articleAuthor: getMetaByProperty("article:author"),
+            publishedTime: getMetaByProperty("article:published_time"),
+            modifiedTime: getMetaByProperty("article:modified_time"),
+
+            canonical: document.querySelector('link[rel="canonical"]')?.getAttribute("href"),
+            favicon: document.querySelector('link[rel="icon"]')?.getAttribute("href"),
+
+            jsonLd: extractJsonLd(),
+            statusCode: 200,
           },
         };
       }),
@@ -80,28 +129,45 @@ export const handleScrape = async (
 
     times.extractionTime = Date.now() - startTime - times.pageLoadTime;
 
-    scrapeResponse.metadata = metadata;
-    scrapeResponse.links = links;
+    let scrapeResponse: Record<string, any> = { content: {}, metadata, links };
+
+    let cleanedHtml: string;
+    let readabilityContent: DefuddleResponse;
 
     if (format && format.length > 0) {
       if (format.includes(ScrapeFormat.HTML)) {
         scrapeResponse.content.html = html;
       }
-      if (format.includes(ScrapeFormat.READABILITY)) {
-        scrapeResponse.content.readability = getReadabilityContent(html);
-        times.readabilityTime = Date.now() - startTime - times.extractionTime;
+
+      const needsCleanedHtml = format.includes(ScrapeFormat.CLEANED_HTML);
+
+      const needsReadability =
+        format.includes(ScrapeFormat.READABILITY) || format.includes(ScrapeFormat.MARKDOWN);
+
+      if (needsCleanedHtml) {
+        const cleanHtmlStart = Date.now();
+        cleanedHtml = cleanHtml(html);
+        times.cleanedHtmlTime = Date.now() - cleanHtmlStart;
+
+        if (format.includes(ScrapeFormat.CLEANED_HTML)) {
+          scrapeResponse.content.cleaned_html = cleanedHtml;
+        }
       }
-      if (format.includes(ScrapeFormat.CLEANED_HTML)) {
-        scrapeResponse.content.cleaned_html = cleanHtml(html);
-        times.cleanedHtmlTime = (Date.now() - times.readabilityTime || Date.now() - times.extractionTime) - startTime;
+
+      if (needsReadability) {
+        const readabilityStart = Date.now();
+        readabilityContent = await getDefuddleContent(transformHtml(html, url));
+        times.readabilityTime = Date.now() - readabilityStart;
+
+        if (format.includes(ScrapeFormat.READABILITY)) {
+          scrapeResponse.content.readability = readabilityContent.content;
+        }
       }
+
       if (format.includes(ScrapeFormat.MARKDOWN)) {
-        const readabilityContent = scrapeResponse.content.readability ?? getReadabilityContent(html);
-        scrapeResponse.content.markdown = getMarkdown(readabilityContent ? readabilityContent?.content : html);
-        times.markdownTime =
-          (Date.now() - times.cleanedHtmlTime ||
-            Date.now() - times.readabilityTime ||
-            Date.now() - times.extractionTime) - startTime;
+        const markdownStart = Date.now();
+        scrapeResponse.content.markdown = await htmlToMarkdown(readabilityContent!.content);
+        times.markdownTime = Date.now() - markdownStart;
       }
     } else {
       scrapeResponse.content.html = html;
@@ -116,14 +182,6 @@ export const handleScrape = async (
     }
 
     times.totalInstanceTime = Date.now() - startTime;
-
-    if (url) {
-      if (proxy) {
-        await page.browserContext().close();
-      } else {
-        await browserService.refreshPrimaryPage();
-      }
-    }
 
     if (logUrl) {
       await updateLog(logUrl, { times });
@@ -141,6 +199,13 @@ export const handleScrape = async (
       await browserService.refreshPrimaryPage();
     }
     return reply.code(500).send({ message: error });
+  } finally {
+    if (context) {
+      await context.close().catch(() => {});
+    }
+    if (proxy) {
+      await proxy.close(true).catch(() => {});
+    }
   }
 };
 
@@ -153,16 +218,23 @@ export const handleScreenshot = async (
   const startTime = Date.now();
   let times: Record<string, number> = {};
   const { url, logUrl, proxyUrl, delay, fullPage } = request.body;
+
+  let proxy: IProxyServer | null = null;
+  let context: BrowserContext | null = null;
+
   if (!browserService.isRunning()) {
     await browserService.launch();
   }
+
   try {
-    const proxy = await getProxyServer(proxyUrl, sessionService);
+    if (proxyUrl) {
+      proxy = await sessionService.proxyFactory(proxyUrl);
+      await proxy.listen();
+    }
 
     times.proxyTime = Date.now() - startTime;
 
     let page: Page;
-    let context: BrowserContext;
 
     if (proxy) {
       context = await browserService.createBrowserContext(proxy.url);
@@ -172,8 +244,13 @@ export const handleScreenshot = async (
       page = await browserService.getPrimaryPage();
       times.pageTime = Date.now() - startTime;
     }
+
     if (url) {
-      await page.goto(url, { timeout: 30000, waitUntil: "domcontentloaded" });
+      const normalizedUrl = normalizeUrl(url);
+      if (!normalizedUrl) {
+        throw new Error(`Invalid URL: ${url}`);
+      }
+      await page.goto(normalizedUrl, { timeout: 30000, waitUntil: "domcontentloaded" });
       times.pageLoadTime = Date.now() - times.pageTime - times.proxyTime - startTime;
     }
 
@@ -182,15 +259,8 @@ export const handleScreenshot = async (
     }
 
     const screenshot = await page.screenshot({ fullPage, type: "jpeg", quality: 100 });
-    times.screenshotTime = Date.now() - times.pageLoadTime - times.pageTime - times.proxyTime - startTime;
-
-    if (url) {
-      if (proxy) {
-        await page.browserContext().close();
-      } else {
-        await browserService.refreshPrimaryPage();
-      }
-    }
+    times.screenshotTime =
+      Date.now() - times.pageLoadTime - times.pageTime - times.proxyTime - startTime;
 
     if (logUrl) {
       await updateLog(logUrl, { times });
@@ -209,6 +279,13 @@ export const handleScreenshot = async (
     }
 
     return reply.code(500).send({ message: error });
+  } finally {
+    if (context) {
+      await context.close().catch(() => {});
+    }
+    if (proxy) {
+      await proxy.close(true).catch(() => {});
+    }
   }
 };
 
@@ -222,17 +299,22 @@ export const handlePDF = async (
   let times: Record<string, number> = {};
   const { url, logUrl, proxyUrl, delay } = request.body;
 
+  let proxy: IProxyServer | null = null;
+  let context: BrowserContext | null = null;
+
   if (!browserService.isRunning()) {
     await browserService.launch();
   }
 
   try {
-    const proxy = await getProxyServer(proxyUrl, sessionService);
+    if (proxyUrl) {
+      proxy = await sessionService.proxyFactory(proxyUrl);
+      await proxy.listen();
+    }
 
     times.proxyTime = Date.now() - startTime;
 
     let page: Page;
-    let context: BrowserContext;
 
     if (proxy) {
       context = await browserService.createBrowserContext(proxy.url);
@@ -244,7 +326,11 @@ export const handlePDF = async (
     }
 
     if (url) {
-      await page.goto(url, { timeout: 30000, waitUntil: "domcontentloaded" });
+      const normalizedUrl = normalizeUrl(url);
+      if (!normalizedUrl) {
+        throw new Error(`Invalid URL: ${url}`);
+      }
+      await page.goto(normalizedUrl, { timeout: 30000, waitUntil: "domcontentloaded" });
       times.pageLoadTime = Date.now() - times.pageTime - times.proxyTime - startTime;
     }
 
@@ -255,26 +341,29 @@ export const handlePDF = async (
     const pdf = await page.pdf();
     times.pdfTime = Date.now() - times.pageLoadTime - times.pageTime - times.proxyTime - startTime;
 
-    if (url) {
-      if (proxy) {
-        await page.browserContext().close();
-      } else {
-        await browserService.refreshPrimaryPage();
-      }
-    }
-
     if (logUrl) {
       await updateLog(logUrl, { times });
     }
+
     return reply.send(pdf);
   } catch (e: unknown) {
     const error = getErrors(e);
+
     if (logUrl) {
       await updateLog(logUrl, { times, response: { browserError: error } });
     }
+
     if (url) {
       await browserService.refreshPrimaryPage();
     }
+
     return reply.code(500).send({ message: error });
+  } finally {
+    if (context) {
+      await context.close().catch(() => {});
+    }
+    if (proxy) {
+      await proxy.close(true).catch(() => {});
+    }
   }
 };

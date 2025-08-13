@@ -1,18 +1,25 @@
 import { IncomingMessage } from "http";
 import puppeteer, { Browser, CDPSession, Page } from "puppeteer-core";
 import { Duplex } from "stream";
-import WebSocket from "ws";
+import WebSocket, { Server } from "ws";
 
-import { SessionService } from "../../services/session.service.js";
 import { env } from "../../env.js";
-import { PageInfo, MouseEvent, NavigationEvent, KeyEvent, CloseTabEvent } from "../../types/casting.js";
+import { SessionService } from "../../services/session.service.js";
+import {
+  CloseTabEvent,
+  GetSelectedTextEvent,
+  KeyEvent,
+  MouseEvent,
+  NavigationEvent,
+  PageInfo,
+} from "../../types/casting.js";
 import { getPageFavicon, getPageTitle, navigatePage } from "../../utils/casting.js";
 
 export async function handleCastSession(
   request: IncomingMessage,
   socket: Duplex,
   head: Buffer,
-  wss: WebSocket.Server,
+  wss: Server,
   sessionService: SessionService,
   params: Record<string, string> | undefined,
 ): Promise<void> {
@@ -35,7 +42,8 @@ export async function handleCastSession(
   const requestedPageId = params?.pageId || queryParams.get("pageId") || null;
   const requestedPageIndex = params?.pageIndex || queryParams.get("pageIndex") || null;
 
-  const tabDiscoveryMode = queryParams.get("tabInfo") === "true" || (!requestedPageId && !requestedPageIndex);
+  const tabDiscoveryMode =
+    queryParams.get("tabInfo") === "true" || (!requestedPageId && !requestedPageIndex);
 
   const { height, width } = (session.dimensions as { width: number; height: number }) ?? {
     width: 1920,
@@ -134,7 +142,9 @@ export async function handleCastSession(
       }
     };
 
-    const findTargetPage = async (pages: Page[]): Promise<{ page: Page; pageId: string } | null> => {
+    const findTargetPage = async (
+      pages: Page[],
+    ): Promise<{ page: Page; pageId: string } | null> => {
       if (tabDiscoveryMode) return null; // No target page in tab discovery mode
 
       if (requestedPageId) {
@@ -272,7 +282,12 @@ export async function handleCastSession(
 
         ws.on("message", async (message) => {
           try {
-            const data: MouseEvent | KeyEvent | NavigationEvent | CloseTabEvent = JSON.parse(message.toString());
+            const data:
+              | MouseEvent
+              | KeyEvent
+              | NavigationEvent
+              | CloseTabEvent
+              | GetSelectedTextEvent = JSON.parse(message.toString());
             const { type } = data;
 
             if (!targetClient || !targetPage) {
@@ -306,6 +321,7 @@ export async function handleCastSession(
                   key: event.key,
                   windowsVirtualKeyCode: event.keyCode,
                   nativeVirtualKeyCode: event.keyCode,
+                  modifiers: event.modifiers || 0,
                   autoRepeat: false,
                   isKeypad: false,
                   isSystemKey: false,
@@ -325,6 +341,35 @@ export async function handleCastSession(
                 }
                 break;
               }
+              case "getSelectedText": {
+                try {
+                  const selectedText = await targetPage.evaluate(() => {
+                    const selection = window.getSelection();
+                    return selection ? selection.toString() : "";
+                  });
+
+                  // Send the selected text back to the client
+                  ws.send(
+                    JSON.stringify({
+                      type: "selectedTextResponse",
+                      pageId: (data as GetSelectedTextEvent).pageId,
+                      text: selectedText,
+                    }),
+                  );
+                } catch (error) {
+                  console.error("Failed to get selected text:", error);
+                  ws.send(
+                    JSON.stringify({
+                      type: "selectedTextResponse",
+                      pageId: (data as GetSelectedTextEvent).pageId,
+                      text: "",
+                      error: error instanceof Error ? error.message : "Unknown error",
+                    }),
+                  );
+                }
+                break;
+              }
+
               default:
                 console.warn("Unknown event type:", type);
             }

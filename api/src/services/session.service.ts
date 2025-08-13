@@ -1,25 +1,24 @@
-import axios, { AxiosError } from "axios";
 import { FastifyBaseLogger } from "fastify";
-import { HttpsProxyAgent } from "https-proxy-agent";
+import { mkdir } from "fs/promises";
 import os from "os";
 import path from "path";
-import { SocksProxyAgent } from "socks-proxy-agent";
 import { v4 as uuidv4 } from "uuid";
 import { env } from "../env.js";
 import { CredentialsOptions, SessionDetails } from "../modules/sessions/sessions.schema.js";
 import { BrowserLauncherOptions } from "../types/index.js";
-import { ProxyServer } from "../utils/proxy.js";
+import { IProxyServer, ProxyServer } from "../utils/proxy.js";
+import { getBaseUrl, getUrl } from "../utils/url.js";
 import { CDPService } from "./cdp/cdp.service.js";
 import { CookieData } from "./context/types.js";
 import { FileService } from "./file.service.js";
 import { SeleniumService } from "./selenium.service.js";
-import { mkdir } from "fs/promises";
-import { getUrl, getBaseUrl } from "../utils/url.js";
+import { TimezoneFetcher } from "./timezone-fetcher.service.js";
+import { deepMerge } from "../utils/context.js";
 
 type Session = SessionDetails & {
   completion: Promise<void>;
   complete: (value: void) => void;
-  proxyServer: ProxyServer | undefined;
+  proxyServer: IProxyServer | undefined;
 };
 
 const sessionStats = {
@@ -44,11 +43,15 @@ const defaultSession = {
   solveCaptcha: false,
 };
 
+export type ProxyFactory = (proxyUrl: string) => Promise<IProxyServer> | IProxyServer;
+
 export class SessionService {
   private logger: FastifyBaseLogger;
   private cdpService: CDPService;
   private seleniumService: SeleniumService;
   private fileService: FileService;
+  private timezoneFetcher: TimezoneFetcher;
+  public proxyFactory: ProxyFactory = (proxyUrl) => new ProxyServer(proxyUrl);
 
   public pastSessions: Session[] = [];
   public activeSession: Session;
@@ -63,6 +66,7 @@ export class SessionService {
     this.seleniumService = config.seleniumService;
     this.fileService = config.fileService;
     this.logger = config.logger;
+    this.timezoneFetcher = new TimezoneFetcher(config.logger);
     this.activeSession = {
       id: uuidv4(),
       createdAt: new Date().toISOString(),
@@ -91,6 +95,8 @@ export class SessionService {
     dimensions?: { width: number; height: number };
     extra?: Record<string, Record<string, string>>;
     credentials: CredentialsOptions;
+    skipFingerprintInjection?: boolean;
+    userPreferences?: Record<string, any>;
   }): Promise<SessionDetails> {
     const {
       sessionId,
@@ -104,9 +110,24 @@ export class SessionService {
       blockAds,
       extra,
       credentials,
+      skipFingerprintInjection,
+      userPreferences,
     } = options;
 
-    let timezone = options.timezone;
+    // start fetching timezone as early as possible
+    let timezonePromise: Promise<string>;
+    if (options.timezone) {
+      timezonePromise = Promise.resolve(options.timezone);
+    } else if (proxyUrl) {
+      timezonePromise = this.timezoneFetcher.getTimezone(
+        proxyUrl,
+        env.DEFAULT_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone,
+      );
+    } else {
+      timezonePromise = Promise.resolve(
+        env.DEFAULT_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone,
+      );
+    }
 
     const sessionInfo = await this.resetSessionInfo({
       id: sessionId || uuidv4(),
@@ -117,50 +138,24 @@ export class SessionService {
       isSelenium,
     });
 
-    if (proxyUrl) {
-      this.activeSession.proxyServer = new ProxyServer(proxyUrl);
-      this.activeSession.proxyServer.on("connectionClosed", ({ stats }) => {
-        if (stats) {
-          this.activeSession.proxyTxBytes += stats.trgTxBytes;
-          this.activeSession.proxyRxBytes += stats.trgRxBytes;
-        }
-      });
-      await this.activeSession.proxyServer.listen();
-
-      // Fetch timezone information from the proxy's location if timezone isn't already specified
-      if (!timezone) {
-        try {
-          console.log(proxyUrl);
-          const proxyUrlObj = new URL(proxyUrl);
-          console.log(proxyUrlObj);
-          const isSocks = proxyUrl.startsWith("socks");
-
-          let agent;
-          if (isSocks) {
-            agent = new SocksProxyAgent(proxyUrl);
-          } else {
-            agent = new HttpsProxyAgent(proxyUrl);
-          }
-
-          this.logger.info("Fetching timezone information based on proxy location");
-          const response = await axios.get("http://ip-api.com/json", {
-            httpAgent: agent,
-            httpsAgent: agent,
-            timeout: 5000,
-          });
-
-          if (response.data && response.data.status === "success" && response.data.timezone) {
-            timezone = response.data.timezone;
-            this.logger.info(`Setting timezone to ${timezone} based on proxy location`);
-          }
-        } catch (error: unknown) {
-          this.logger.error(`Failed to fetch timezone information: ${(error as AxiosError).message}`);
-        }
-      }
-    }
-
     const userDataDir = path.join(os.tmpdir(), sessionInfo.id);
     await mkdir(userDataDir, { recursive: true });
+
+    if (proxyUrl) {
+      this.activeSession.proxyServer = await this.proxyFactory(proxyUrl);
+      await this.activeSession.proxyServer.listen();
+    }
+
+    const defaultUserPreferences = {
+      plugins: {
+        always_open_pdf_externally: true,
+        plugins_disabled: ["Chrome PDF Viewer"],
+      },
+    };
+
+    const mergedUserPreferences = userPreferences
+      ? deepMerge(defaultUserPreferences, userPreferences)
+      : defaultUserPreferences;
 
     const browserLauncherOptions: BrowserLauncherOptions = {
       options: {
@@ -172,11 +167,13 @@ export class SessionService {
       blockAds,
       extensions: extensions || [],
       logSinkUrl,
-      timezone,
+      timezone: timezonePromise,
       dimensions,
       userDataDir,
+      userPreferences: mergedUserPreferences,
       extra,
       credentials,
+      skipFingerprintInjection,
     };
 
     if (isSelenium) {
@@ -201,7 +198,9 @@ export class SessionService {
         debugUrl: getUrl("v1/sessions/debug"),
         debuggerUrl: getUrl("v1/devtools/inspector.html"),
         sessionViewerUrl: getBaseUrl(),
-        userAgent: this.cdpService.getUserAgent(),
+        userAgent:
+          this.cdpService.getUserAgent() ||
+          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
       });
     }
 
@@ -211,7 +210,13 @@ export class SessionService {
   public async endSession(): Promise<SessionDetails> {
     this.activeSession.complete();
     this.activeSession.status = "released";
-    this.activeSession.duration = new Date().getTime() - new Date(this.activeSession.createdAt).getTime();
+    this.activeSession.duration =
+      new Date().getTime() - new Date(this.activeSession.createdAt).getTime();
+
+    if (this.activeSession.proxyServer) {
+      this.activeSession.proxyTxBytes = this.activeSession.proxyServer.txBytes;
+      this.activeSession.proxyRxBytes = this.activeSession.proxyServer.rxBytes;
+    }
 
     if (this.activeSession.isSelenium) {
       this.seleniumService.close();
@@ -252,5 +257,9 @@ export class SessionService {
     };
 
     return this.activeSession;
+  }
+
+  public setProxyFactory(factory: ProxyFactory) {
+    this.proxyFactory = factory;
   }
 }
